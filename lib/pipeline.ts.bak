@@ -1,0 +1,186 @@
+// lib/pipeline.ts — L1 workflow ownership for invoice-reconcile (payment ↔ invoice reconciliation).
+// Multi-step state machine. `ingest` and `match` are DETERMINISTIC (no LLM) = L3 vertical moat.
+// `report` is model-assisted (or mocked in Demo mode).
+import fs from 'fs'
+import path from 'path'
+import crypto from 'crypto'
+
+export type StepId = 'ingest' | 'match' | 'report'
+
+export const STEP_ORDER: StepId[] = ['ingest', 'match', 'report']
+export const STEP_TOTAL = STEP_ORDER.length
+
+export const STEP_LABELS: Record<StepId, string> = {
+  ingest: 'Parse invoices & payments',
+  match: 'Match & balance',
+  report: 'Write reconciliation',
+}
+
+export function getStepLabel(step: StepId): string {
+  return STEP_LABELS[step] || String(step)
+}
+
+export function getNextStep(step: StepId): StepId | null {
+  const i = STEP_ORDER.indexOf(step)
+  return i >= 0 && i < STEP_ORDER.length - 1 ? STEP_ORDER[i + 1] : null
+}
+
+export interface RunState {
+  runId: string
+  slug: string
+  createdAt: string
+  updatedAt: string
+  status: 'running' | 'awaiting_confirm' | 'done' | 'error'
+  step: StepId
+  inputs: Record<string, string>
+  artifacts: Partial<Record<StepId, any>>
+  asset?: any
+}
+
+const DATA_DIR = path.join(process.cwd(), '.data', 'runs')
+
+function fileFor(slug: string) {
+  return path.join(DATA_DIR, `${slug}.jsonl`)
+}
+
+export function createRun(slug: string, inputs: Record<string, string>): RunState {
+  const now = new Date().toISOString()
+  return {
+    runId: crypto.randomUUID(),
+    slug,
+    createdAt: now,
+    updatedAt: now,
+    status: 'running',
+    step: STEP_ORDER[0],
+    inputs,
+    artifacts: {},
+  }
+}
+
+export function loadRun(slug: string, runId?: string): RunState | null {
+  if (!runId) return null
+  try {
+    if (!fs.existsSync(fileFor(slug))) return null
+    const lines = fs.readFileSync(fileFor(slug), 'utf-8').split('\n').filter(Boolean)
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const r = JSON.parse(lines[i])
+      if (r.runId === runId) return r as RunState
+    }
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+export function saveRun(run: RunState): RunState {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true })
+    fs.appendFileSync(fileFor(run.slug), JSON.stringify(run) + '\n')
+  } catch {
+    /* non-fatal */
+  }
+  return run
+}
+
+export function nextStep(run: RunState, _action: 'next' | 'confirm' | 'reject' = 'next'): RunState {
+  const next = getNextStep(run.step)
+  const now = new Date().toISOString()
+  if (!next) return { ...run, status: 'done', updatedAt: now }
+  return { ...run, step: next, status: 'running', updatedAt: now }
+}
+
+export function finalizeRun(run: RunState): RunState {
+  return { ...run, status: 'done', updatedAt: new Date().toISOString() }
+}
+
+export function appendSection(run: RunState, step: StepId, value: any): RunState {
+  return { ...run, artifacts: { ...run.artifacts, [step]: value }, updatedAt: new Date().toISOString() }
+}
+
+// --- Deterministic steps (L3: no LLM) ---
+
+export interface Entry {
+  name: string
+  amount: number
+  raw: string
+}
+
+function amountOf(s: string): number {
+  const m = s.match(/[\d][\d,]*(?:\.\d{1,2})?/)
+  return m ? parseFloat(m[0].replace(/,/g, '')) : 0
+}
+
+function nameOf(line: string): string {
+  const parts = line.split(',').map((x) => x.trim()).filter(Boolean)
+  const nonNum = parts.filter((p) => !/[\d]/.test(p))
+  return (nonNum[nonNum.length - 1] || parts[0] || '').trim()
+}
+
+function parseEntries(raw: string): Entry[] {
+  return String(raw || '')
+    .split(/\n/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((line) => ({ name: nameOf(line), amount: amountOf(line), raw: line }))
+}
+
+export function runDeterministicStep(
+  step: StepId,
+  inputs: Record<string, string>,
+  prev?: any,
+): { text: string; artifact: any } | null {
+  if (step === 'ingest') {
+    const invoices = parseEntries(inputs['invoices'])
+    const payments = parseEntries(inputs['payments'])
+    const text =
+      `Parsed ${invoices.length} invoices and ${payments.length} payments.`
+    return { text, artifact: { invoices, payments } }
+  }
+  if (step === 'match') {
+    const ing = (prev || {}) as { invoices?: Entry[]; payments?: Entry[] }
+    const invoices = ing.invoices || []
+    const payments = ing.payments || []
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '')
+    const paidByName = new Map<string, number>()
+    for (const p of payments) {
+      const k = norm(p.name)
+      paidByName.set(k, (paidByName.get(k) || 0) + p.amount)
+    }
+    // duplicate detection: same name+amount more than once
+    const seen = new Map<string, number>()
+    const duplicates: string[] = []
+    for (const p of payments) {
+      const k = norm(p.name) + '|' + p.amount
+      seen.set(k, (seen.get(k) || 0) + 1)
+    }
+    for (const [k, c] of seen) if (c > 1) duplicates.push(k)
+    const rows = invoices.map((inv) => {
+      const got = paidByName.get(norm(inv.name)) || 0
+      const status = got >= inv.amount ? 'PAID' : got > 0 ? `PARTIAL ($${(inv.amount - got).toFixed(2)} left)` : 'UNPAID'
+      return { name: inv.name, invoice: inv.amount, paid: +got.toFixed(2), status }
+    })
+    const invTotal = +invoices.reduce((a, i) => a + i.amount, 0).toFixed(2)
+    const payTotal = +payments.reduce((a, p) => a + p.amount, 0).toFixed(2)
+    const balanced = Math.abs(invTotal - payTotal) < 0.01
+    const flags: string[] = []
+    if (duplicates.length) flags.push('duplicate_payment_entries')
+    if (!balanced) flags.push('invoice_payment_total_mismatch')
+    if (invoices.length === 0) flags.push('no_invoices')
+    const text =
+      `Reconciliation: ${rows.length} invoice(s), ${payTotal} paid vs ${invTotal} invoiced. ` +
+      (balanced ? 'Totals balanced.' : 'Totals do NOT balance.') +
+      (duplicates.length ? ` ${duplicates.length} duplicate payment group(s) found.` : '')
+    return {
+      text,
+      artifact: {
+        rows,
+        invTotal,
+        payTotal,
+        balanced,
+        duplicateCount: duplicates.length,
+        flags,
+      },
+    }
+  }
+  return null // 'report' handled in tool.ts
+}

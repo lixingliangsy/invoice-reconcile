@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+
+# LLM / AI answer-engine indexing
+LLM-Content: https://invoice-reconcile.lxsaihub.com/llms.txt
+
+Sitemap: https://invoice-reconcile.lxsaihub.com/sitemap.xml

@@ -1,0 +1,30 @@
+// pages/api/runs.ts — L2: list + export past workflow runs (owned by this product).
+import type { NextApiRequest, NextApiResponse } from 'next'
+import fs from 'fs'
+import path from 'path'
+import { PRODUCT } from '../../lib/product'
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
+  const slug = PRODUCT.slug
+  const file = path.join(process.cwd(), '.data', 'runs', `${slug}.jsonl`)
+  try {
+    if (!fs.existsSync(file)) return res.status(200).json({ ok: true, runs: [] })
+    const runs = fs
+      .readFileSync(file, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+    const latest = new Map<string, any>()
+    for (const r of runs) latest.set(r.runId, r)
+    const out = Array.from(latest.values()).sort((a: any, b: any) => (a.updatedAt < b.updatedAt ? 1 : -1))
+    if (req.query.format === 'json') {
+      res.setHeader('Content-Type', 'application/json')
+      res.setHeader('Content-Disposition', `attachment; filename="${slug}-runs.json"`)
+      return res.status(200).json({ ok: true, slug, exportedAt: new Date().toISOString(), count: out.length, runs: out })
+    }
+    return res.status(200).json({ ok: true, slug, count: out.length, runs: out.slice(0, 50) })
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || 'read failed' })
+  }
+}

@@ -1,0 +1,40 @@
+// lib/auditLog.ts — L4 trust & accountability trail for invoice-reconcile.
+import fs from 'fs'
+import path from 'path'
+import crypto from 'crypto'
+
+const DATA_DIR = path.join(process.cwd(), '.data', 'audit')
+
+interface AuditEvent {
+  id: string
+  ts: string
+  slug: string
+  runId: string
+  step?: string
+  mode: 'demo' | 'live'
+  ok: boolean
+  source?: string
+  error?: string
+  meta?: Record<string, any>
+}
+
+export async function writeAudit(e: Partial<AuditEvent> & { slug: string; runId: string }): Promise<void> {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true })
+    const row: AuditEvent = {
+      id: crypto.randomUUID(),
+      ts: new Date().toISOString(),
+      slug: e.slug,
+      runId: e.runId,
+      step: e.step,
+      mode: e.mode,
+      ok: e.ok,
+      source: e.source,
+      error: e.error,
+      meta: e.meta,
+    }
+    fs.appendFileSync(path.join(DATA_DIR, `${new Date().toISOString().slice(0, 10)}.jsonl`), JSON.stringify(row) + '\n')
+  } catch {
+    /* non-fatal audit */
+  }
+}

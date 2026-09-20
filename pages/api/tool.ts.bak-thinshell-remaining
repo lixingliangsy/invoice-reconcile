@@ -1,0 +1,240 @@
+// pages/api/tool.ts — invoice-reconcile multi-step workflow + P0 anti-silent-mock matrix.
+import type { NextApiRequest, NextApiResponse } from 'next'
+import { PRODUCT } from '../../lib/product'
+import { AI_QUOTAS, checkAndConsumeQuota, defaultModel, resolvePlan } from '../../lib/aiGateway'
+import { getByokKey } from '../../lib/byokStore'
+import {
+  createRun,
+  loadRun,
+  saveRun,
+  nextStep,
+  finalizeRun,
+  appendSection,
+  getNextStep,
+  STEP_ORDER,
+  getStepLabel,
+  STEP_TOTAL,
+  StepId,
+  RunState,
+  runDeterministicStep,
+} from '../../lib/pipeline'
+import { writeAudit } from '../../lib/auditLog'
+import { runAllRules, RULESET_ID, RULESET_VERSION } from '../../lib/rules/reconcile-rules'
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  let inputs: Record<string, string> = {}
+  try {
+    const body = (req.body || {}) as {
+      inputs?: Record<string, string>
+      useMock?: boolean
+      step?: string
+      runId?: string
+      action?: 'next' | 'confirm' | 'reject'
+      useByok?: boolean
+      plan?: 'free' | 'pro' | 'enterprise'
+    }
+    inputs = body.inputs || {}
+    const useMock = !!body.useMock
+    const slug = String((PRODUCT as any).slug || 'invoice-reconcile')
+
+    const plan = resolvePlan(req)
+    const byokKey = plan === 'enterprise' ? getByokKey(slug) : null
+    const apiKey = byokKey || process.env.OPENAI_API_KEY || ''
+    const hasKey = !!apiKey
+
+    // --- Validate step (L1) ---
+    let currentStep: StepId
+    const step = String(body.step || '')
+    if (step) {
+      if (!STEP_ORDER.includes(step as StepId)) {
+        return res.status(400).json({
+          ok: false,
+          error: `Invalid step "${step}". Allowed: ${STEP_ORDER.join(' → ')}`,
+          allowed: STEP_ORDER,
+          code: 'INVALID_STEP',
+        })
+      }
+      currentStep = step as StepId
+    } else {
+      currentStep = STEP_ORDER[0]
+    }
+
+    let run: RunState
+    if (body.runId) {
+      const loaded = loadRun(slug, body.runId)
+      if (!loaded) return res.status(404).json({ ok: false, error: 'Run not found', code: 'RUN_NOT_FOUND' })
+      run = loaded
+    } else {
+      run = createRun(slug, inputs)
+    }
+    if (currentStep !== run.step) {
+      return res.status(400).json({
+        ok: false,
+        error: `Step out of order. Current step is "${run.step}". You requested "${currentStep}".`,
+        currentStep: run.step,
+        requested: currentStep,
+        code: 'STEP_ORDER',
+      })
+    }
+
+    const mockFn = typeof (PRODUCT as any).mock === 'function' ? (PRODUCT as any).mock : null
+
+    // --- Explicit Demo mode: 200 + demo:true. Never silent. ---
+    if (useMock) {
+      const { run: finalRun, result, rules } = await runPipeline(run, inputs, () =>
+        mockFn
+          ? String(mockFn(inputs))
+          : `${(PRODUCT as any).name} DEMO\n\nPreview only. Add OPENAI_API_KEY for live runs.`,
+      )
+      await writeAudit({ slug, runId: finalRun.runId, step: currentStep, mode: 'demo', ok: true })
+      return res.status(200).json({
+        ok: true,
+        result,
+        rules,
+        ruleset: `${RULESET_ID}@${RULESET_VERSION}`,
+        runId: finalRun.runId,
+        step: finalRun.step,
+        stepLabel: getStepLabel(currentStep),
+        stepIndex: STEP_ORDER.indexOf(currentStep) + 1,
+        stepTotal: STEP_TOTAL,
+        nextStep: getNextStep(currentStep),
+        demo: true,
+        mock: true,
+        source: 'Rule-based',
+      })
+    }
+
+    // --- No key: 503 ---
+    if (!hasKey) {
+      await writeAudit({ slug, runId: run.runId, step: currentStep, mode: 'live', ok: false, error: 'no_key' })
+      return res.status(503).json({
+        ok: false,
+        error: 'AI is not configured. Add OPENAI_API_KEY or enable Demo mode.',
+        configured: false,
+        degraded: true,
+        code: 'AI_NOT_CONFIGURED',
+      })
+    }
+
+    // --- Quota / Fair use (real QuotaCheck.ok) ---
+    const allowed = checkAndConsumeQuota(slug, plan)
+    if (!allowed.ok) {
+      await writeAudit({ slug, runId: run.runId, step: currentStep, mode: 'live', ok: false, error: 'quota' })
+      return res.status(429).json({
+        ok: false,
+        error: 'Fair use limit reached. Upgrade or wait for reset.',
+        code: 'QUOTA_EXCEEDED',
+        limits: AI_QUOTAS,
+      })
+    }
+
+    const base = process.env.OPENAI_BASE_URL || 'https://integrate.api.nvidia.com/v1'
+    const model = process.env.OPENAI_MODEL || defaultModel
+
+    let finalRun: RunState
+    let result = ''
+    let rules: any[] = []
+    try {
+      const pr = await runPipeline(run, inputs, async (ctx) => {
+        const inputText = PRODUCT.inputs
+          .map((f: any) => `${f.label}: ${inputs[f.key] || '(not provided)'}`)
+          .join('\n')
+        const match = ctx
+        const matchNote = match
+          ? `\n\nPre-computed (deterministic): ${match.rows?.length || 0} invoice rows, invoiced ${match.invTotal}, paid ${match.payTotal}, balanced=${match.balanced}, duplicates=${match.duplicateCount}.`
+          : ''
+        const r = await fetch(`${base}/chat/completions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: 'system', content: PRODUCT.systemPrompt },
+              { role: 'user', content: inputText + matchNote },
+            ],
+            temperature: 0.7,
+          }),
+        })
+        if (!r.ok) {
+          const t = await r.text()
+          throw new Error('AI request failed: ' + t.slice(0, 160))
+        }
+        const data = await r.json()
+        const text = data.choices?.[0]?.message?.content || ''
+        if (!text.trim()) throw new Error('Empty AI response')
+        return text
+      })
+      finalRun = pr.run
+      result = pr.result
+      rules = pr.rules
+    } catch (e: any) {
+      await writeAudit({ slug, runId: run.runId, step: currentStep, mode: 'live', ok: false, error: 'upstream_fail' })
+      return res.status(502).json({
+        ok: false,
+        error: 'AI service call failed: ' + (e?.message || 'unknown error'),
+        degraded: true,
+        code: 'AI_UPSTREAM_FAILED',
+      })
+    }
+
+    await writeAudit({ slug, runId: finalRun.runId, step: currentStep, mode: 'live', ok: true, source: 'Model-assisted' })
+
+    return res.status(200).json({
+      ok: true,
+      result,
+      rules,
+      ruleset: `${RULESET_ID}@${RULESET_VERSION}`,
+      runId: finalRun.runId,
+      step: finalRun.step,
+      stepLabel: getStepLabel(currentStep),
+      stepIndex: STEP_ORDER.indexOf(currentStep) + 1,
+      stepTotal: STEP_TOTAL,
+      nextStep: getNextStep(currentStep),
+      demo: false,
+      mock: false,
+      source: 'Model-assisted',
+      model,
+    })
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: 'Internal error: ' + (e?.message || 'unknown') })
+  }
+}
+
+async function runPipeline(
+  run0: RunState,
+  inputs: Record<string, string>,
+  getReportText: (ctx: any) => Promise<string> | string,
+): Promise<{ run: RunState; result: string; rules: any[] }> {
+  let run = run0
+  let prevArtifact: any = undefined
+  let reportText = ''
+
+  const startIdx = STEP_ORDER.indexOf(run.step)
+  for (let i = startIdx; i < STEP_ORDER.length; i++) {
+    const step = STEP_ORDER[i]
+    if (step === 'report') {
+      reportText = await getReportText(prevArtifact)
+      const rules = runAllRules(reportText, {
+        balanced: prevArtifact?.balanced,
+        duplicateCount: prevArtifact?.duplicateCount,
+        flags: prevArtifact?.flags,
+      })
+      run = appendSection(run, 'report', { text: reportText, rules })
+      run = nextStep(run)
+    } else {
+      const out = runDeterministicStep(step, inputs, prevArtifact)
+      if (out) {
+        prevArtifact = out.artifact
+        run = appendSection(run, step, out.artifact)
+        run = nextStep(run)
+      }
+    }
+  }
+  run = finalizeRun(run)
+  saveRun(run)
+  const reportArtifact = (run.artifacts as any)?.report
+  const rules = reportArtifact?.rules || []
+  return { run, result: reportText, rules }
+}

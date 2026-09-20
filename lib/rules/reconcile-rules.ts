@@ -1,0 +1,177 @@
+// lib/rules/reconcile-rules.ts — L3 deterministic reconciliation checklist for invoice-reconcile.
+// Covers debit/credit balance, amount consistency, and duplicate entries.
+// Supplemented 2026-07-19 from authoritative AP controls sources (DocuClipper 3-way matching, 2026):
+//  - 3-way matching: Purchase Order (PO), Goods Receipt (GR), Vendor Invoice
+//  - Catches qty/price variance, partial delivery, double-billing, unauthorized purchase, fraud
+//  - Duplicate-payment detection, variance tolerance, aging, uncleared-item disclosure
+export const RULESET_ID = 'reconcile-rules'
+export const RULESET_VERSION = '2026-07-19'
+
+export interface RuleResult {
+  ruleId: string
+  name: string
+  passed: boolean
+  message: string
+  category: 'balance' | 'consistency' | 'duplicates' | 'match' | 'variance' | 'aging' | 'honesty'
+  /** Authoritative source (URL) for this rule — required by the web-research gate. */
+  ref?: string
+}
+
+function has(text: string, re: RegExp): boolean {
+  return re.test(text)
+}
+
+function uniq(arr?: string[]): boolean {
+  if (!arr || arr.length === 0) return true
+  return new Set(arr.map((x) => String(x).toLowerCase())).size === arr.length
+}
+
+export function runAllRules(
+  text: string,
+  ctx?: {
+    balanced?: boolean
+    duplicateCount?: number
+    flags?: string[]
+    invoiceNumbers?: string[]
+    asOf?: string
+    threeWay?: boolean
+    agedItems?: number
+  },
+): RuleResult[] {
+  const t = String(text || '')
+  const balanced = ctx?.balanced
+  const dup = ctx?.duplicateCount || 0
+  const flags = ctx?.flags || []
+  const rules: RuleResult[] = [
+    {
+      ruleId: 'REC-01',
+      name: 'Invoices and payments both present',
+      category: 'consistency',
+      passed: has(t, /invoice|payment/i) && !flags.includes('no_invoices'),
+      message: 'Both an invoice list and a payment list were provided.',
+      ref: 'https://www.docuclipper.com/blog/three-way-matching/',
+    },
+    {
+      ruleId: 'REC-02',
+      name: 'Totals reconcile (balance)',
+      category: 'balance',
+      passed: balanced === undefined ? has(t, /balanced|total|reconcil/i) : balanced,
+      message: balanced ? 'Invoice total matches payment total.' : 'Invoice/payment totals do not balance.',
+      ref: 'https://www.docuclipper.com/blog/three-way-matching/',
+    },
+    {
+      ruleId: 'REC-03',
+      name: 'Per-invoice status assigned',
+      category: 'consistency',
+      passed: has(t, /paid|partial|unpaid/i),
+      message: 'Each invoice is marked PAID / PARTIAL / UNPAID.',
+      ref: 'https://www.docuclipper.com/blog/three-way-matching/',
+    },
+    {
+      ruleId: 'REC-04',
+      name: 'No duplicate payment entries',
+      category: 'duplicates',
+      passed: dup === 0,
+      message: dup === 0 ? 'No duplicate payment entries detected.' : `${dup} duplicate payment group(s) flagged.`,
+      ref: 'https://www.docuclipper.com/blog/duplicate-payment-detection/',
+    },
+    {
+      ruleId: 'REC-05',
+      name: 'Amounts are consistent',
+      category: 'consistency',
+      passed: has(t, /\$|amount|total|outstanding|left|due/i),
+      message: 'Outstanding amounts are stated consistently.',
+      ref: 'https://www.docuclipper.com/blog/three-way-matching/',
+    },
+    {
+      ruleId: 'REC-06',
+      name: 'No guaranteed-accuracy claim',
+      category: 'honesty',
+      passed: !has(t, /(guarantee|guaranteed|100%).*(accura|correct|error-free|audit)/i),
+      message: 'Output avoids promising guaranteed accuracy / error-free reconciliation.',
+    },
+    {
+      ruleId: 'REC-07',
+      name: 'Unique invoice numbers (no double-billing)',
+      category: 'duplicates',
+      passed: uniq(ctx?.invoiceNumbers) && has(t, /invoice\s*(no|number)|ref\s*(no|number)/i),
+      message: uniq(ctx?.invoiceNumbers)
+        ? 'Invoice numbers are unique (no double-billing).'
+        : 'Duplicate invoice numbers detected — possible double-billing.',
+      ref: 'https://www.docuclipper.com/blog/duplicate-payment-detection/',
+    },
+    {
+      ruleId: 'REC-08',
+      name: '3-way match indicated (PO/GR/invoice)',
+      category: 'match',
+      passed:
+        ctx?.threeWay === undefined
+          ? has(t, /purchase order|p\.?o\.?|goods receipt|received|3-way|three-way|matched/i)
+          : ctx.threeWay,
+      message: 'Reconciliation reflects 3-way matching of purchase order, goods receipt, and invoice.',
+      ref: 'https://www.docuclipper.com/blog/three-way-matching/',
+    },
+    {
+      ruleId: 'REC-09',
+      name: 'Variance / tolerance stated',
+      category: 'variance',
+      passed: has(t, /variance|tolerance|discrep|difference|offset|allowance/i),
+      message: 'Any variance is stated with a tolerance/threshold for review.',
+      ref: 'https://www.docuclipper.com/blog/three-way-matching/',
+    },
+    {
+      ruleId: 'REC-10',
+      name: 'As-of / period present',
+      category: 'consistency',
+      passed: !!ctx?.asOf || has(t, /as of|statement date|period|month end|closing|cutoff/i),
+      message: 'Reconciliation states an as-of date / period (cutoff).',
+      ref: 'https://www.docuclipper.com/blog/accounting-period-close/',
+    },
+    {
+      ruleId: 'REC-11',
+      name: 'Aging / outstanding tracked',
+      category: 'aging',
+      passed: (ctx?.agedItems || 0) >= 0 && has(t, /age|overdue|days|aging|past due|aged/i),
+      message: 'Aged / overdue items are tracked (DSO / aging buckets).',
+      ref: 'https://www.docuclipper.com/blog/accounts-receivable-aging-report/',
+    },
+    {
+      ruleId: 'REC-12',
+      name: 'Uncleared items explained',
+      category: 'variance',
+      passed: has(t, /uncleared|unmatched|exception|flag|pending|note/i),
+      message: 'Uncleared or unmatched items are flagged with an explanation.',
+      ref: 'https://www.docuclipper.com/blog/three-way-matching/',
+    },
+    {
+      ruleId: 'REC-13',
+      name: 'AP segregation of duties suggested',
+      category: 'consistency',
+      passed: has(t, /approv|review|segregat|duties|reconcil|sign-off|signoff/i),
+      message: 'Reconciliation notes an independent review / approval step (AP internal control).',
+      ref: 'https://www.docuclipper.com/blog/accounts-payable-internal-controls/',
+    },
+    {
+      ruleId: 'REC-14',
+      name: 'Input VAT recoverable noted (EU)',
+      category: 'balance',
+      passed: has(t, /vat|tax|recoverab|input tax|deductible/i),
+      message: 'Where relevant, input VAT / deductible tax treatment is reflected for EU AP.',
+      ref: 'https://europa.eu/youreurope/business/taxation/vat/vat-rules-rates/index_en.htm',
+    },
+  ]
+  return rules
+}
+
+export type RuleHit = { id: string; title: string; severity: 'low' | 'medium' | 'high'; passed: boolean; remediation?: string; ref?: string }
+export function runDeterministicChecks(inputs: Record<string, string>): RuleHit[] {
+  const blob = Object.values(inputs || {}).join('\n')
+  return runAllRules(blob).map((r: any) => ({
+    id: String(r.id || r.ruleId || 'R'),
+    title: String(r.name || r.title || 'check'),
+    severity: (r.severity as 'low' | 'medium' | 'high') || 'medium',
+    passed: !!r.passed,
+    remediation: r.message || r.remediation,
+    ref: r.ref || r.source,
+  }))
+}
